@@ -1,0 +1,3 @@
+[server]
+# Allow uploading videos up to 500 MB through st.file_uploader.
+maxUploadSize = 500
