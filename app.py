@@ -202,6 +202,53 @@ def extract_json_from_text(text: str) -> dict | None:
     return None
 
 
+
+def trim_text_middle(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = "\n...[contenu réduit pour rester dans le contexte]...\n"
+    keep = max(0, max_chars - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return text[:head].rstrip() + marker + text[-tail:].lstrip()
+
+
+def is_placeholder_llm_response(text: str) -> bool:
+    cleaned = re.sub(r"[\s#*_`>\-–—:.;,!？?]+", "", text or "")
+    return len(cleaned) < 12
+
+
+def build_comparison_prompt(s: dict[str, Any], analyses: dict[str, str]) -> str:
+    max_total = max(1000, int(s["transcript_context_max_chars"]))
+    per_section = max(800, max_total // max(1, len(analyses)))
+    sections = []
+    for key, label in [("A", "Images seules"), ("B", "Transcript seul"), ("C", "Images + transcript"), ("D", "Two-pass keyframes")]:
+        content = trim_text_middle(analyses.get(key, ""), per_section)
+        if not content:
+            content = "[résultat absent ou non exécuté]"
+        sections.append(f"{key} — {label}:\n{content}")
+    return (
+        common_prompt(s)
+        + "\nTu dois comparer les quatre résultats ci-dessous. Réponds en français avec du texte complet, pas seulement un titre Markdown. "
+        + "Commence directement par une phrase de synthèse, puis utilise les rubriques: Synthèse, Comparaison A/B/C/D, Limites, Recommandation. "
+        + "Si un résultat est absent, signale-le explicitement sans bloquer la comparaison.\n\n"
+        + "\n\n".join(sections)
+    )
+
+
+def ollama_generate_with_retry(prompt: str, s: dict[str, Any], retry_instruction: str) -> str:
+    response = ollama_generate(prompt, s)
+    if not is_placeholder_llm_response(response):
+        return response
+    retry_prompt = (
+        prompt
+        + "\n\nLa réponse précédente était vide ou incomplète (par exemple seulement ###). "
+        + retry_instruction
+    )
+    retry = ollama_generate(retry_prompt, s)
+    return retry if retry.strip() else response
+
 def transcribe_video(path: Path, s: dict[str, Any]) -> str:
     def run(device, compute):
         model=WhisperModel(s["whisper_model_size"], device=device, compute_type=compute)
@@ -352,8 +399,11 @@ def main() -> None:
     with tabs[6]:
         if st.button("Comparer A/B/C/D"):
             try:
-                prompt=common_prompt(s)+"\nCompare les quatre stratégies d’analyse. Pour chaque stratégie: compréhension, limites, informations spécifiques. Conclus: transcript seul suffit-il, images utiles, two-pass efficace, meilleur rapport coût/compréhension, recommandation pour beaucoup de vidéos.\nA:\n{}\nB:\n{}\nC:\n{}\nD:\n{}".format(st.session_state.get("analysis_a",""),st.session_state.get("analysis_b",""),st.session_state.get("analysis_c",""),st.session_state.get("analysis_d",""))
-                st.session_state.comparison=ollama_generate(prompt, s)
+                analyses={"A": st.session_state.get("analysis_a", ""), "B": st.session_state.get("analysis_b", ""), "C": st.session_state.get("analysis_c", ""), "D": st.session_state.get("analysis_d", "")}
+                prompt=build_comparison_prompt(s, analyses)
+                st.session_state.comparison=ollama_generate_with_retry(prompt, s, "Réécris une comparaison complète en français, sans commencer par un titre Markdown isolé.")
+                if is_placeholder_llm_response(st.session_state.comparison):
+                    st.warning("La réponse Ollama semble encore incomplète. Augmente num_predict et/ou réduis Transcript max chars, puis relance la comparaison.")
             except OllamaError as e: st.error(str(e))
         st.text_area("Comparaison finale", st.session_state.get("comparison",""), height=400)
     with tabs[7]:
