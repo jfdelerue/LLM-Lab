@@ -379,6 +379,57 @@ def common_prompt(s: dict[str, Any]) -> str:
     return f"Les dialogues peuvent être en {s['dialogue_language']}. L'analyse doit être rédigée en {s['analysis_language']}. Ne réponds pas en russe sauf citation très brève. Objectif: {s['analysis_objective']}."
 
 
+def default_analysis_prompts(s: dict[str, Any]) -> dict[str, str]:
+    """Return the editable instructions used by the three A/B/C analyses."""
+    common = common_prompt(s)
+    return {
+        "analysis_prompt_a": common + "\nDécris ce que l’on comprend uniquement par les images: lieux, personnes, objets, gestes, émotions, textes visibles, limites sans audio/transcript.",
+        "analysis_prompt_b": common + "\nRésume en français ce transcript, sujets, intentions, émotions, contexte probable, ambiguïtés nécessitant l’image.",
+        "analysis_prompt_b_summary": common + "\nFais une synthèse finale en français de ces résumés.",
+        "analysis_prompt_c": common + "\nExplique ce que le transcript permet de comprendre, ce que les images ajoutent, si elles changent l'interprétation ou n'ajoutent presque rien, puis conclus.",
+    }
+
+
+def run_analysis_a(thumbs: list[Thumbnail], s: dict[str, Any], instruction: str,
+                   task: ProgressReporter) -> str:
+    results = []
+    batches = chunks_list(thumbs, s["llm_batch_size"])
+    for batch_number, part in enumerate(batches, 1):
+        task.update((batch_number - 1) / max(1, len(batches)),
+                    f"Lot {batch_number}/{len(batches)} envoyé au LLM")
+        timestamps = ", ".join(f"#{t.index}={t.timestamp_sec:.2f}s" for t in part)
+        results.append(ollama_chat_vision(f"{instruction}\nTimestamps: {timestamps}", part, s,
+                                          s["thumbnail_jpeg_quality"]))
+    return "\n\n".join(results)
+
+
+def run_analysis_b(transcript: str, s: dict[str, Any], instruction: str,
+                   summary_instruction: str, task: ProgressReporter) -> str:
+    results = []
+    transcript_parts = chunks(transcript, int(s["transcript_context_max_chars"]))
+    for part_number, part in enumerate(transcript_parts, 1):
+        task.update((part_number - 1) / (len(transcript_parts) + 1),
+                    f"Partie {part_number}/{len(transcript_parts)} analysée")
+        results.append(ollama_generate(f"{instruction}\n{part}", s))
+    if len(results) == 1:
+        return results[0]
+    task.update(len(results) / (len(results) + 1), "Synthèse des parties")
+    return ollama_generate(f"{summary_instruction}\n" + "\n".join(results), s)
+
+
+def run_analysis_c(thumbs: list[Thumbnail], transcript: str, s: dict[str, Any],
+                   instruction: str, task: ProgressReporter) -> str:
+    context = build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"]))
+    results = []
+    batches = chunks_list(thumbs, s["llm_batch_size"])
+    for batch_number, part in enumerate(batches, 1):
+        task.update((batch_number - 1) / max(1, len(batches)),
+                    f"Lot {batch_number}/{len(batches)} envoyé au LLM")
+        prompt = f"{instruction}\nTranscript réduit:\n{context}"
+        results.append(ollama_chat_vision(prompt, part, s, s["thumbnail_jpeg_quality"]))
+    return "\n\n".join(results)
+
+
 def sidebar() -> dict[str, Any]:
     if "settings" not in st.session_state: st.session_state.settings = load_settings()
     s=st.session_state.settings
@@ -480,43 +531,53 @@ def main() -> None:
         st.text_area("Transcript nettoyé", st.session_state.get("transcript",""), height=400)
     with tabs[4]:
         thumbs=st.session_state.get("thumbnails", []); transcript=st.session_state.get("transcript", "")
+        for key, value in default_analysis_prompts(s).items():
+            st.session_state.setdefault(key, value)
         rows=compute_image_payload_report(thumbs, s["llm_batch_size"])
         with st.expander("Images réellement envoyées au LLM", expanded=True):
             st.write(f"Disponibles: {len(thumbs)}; taille configurée: {s['thumbnail_largest_side_px']} px; images/appel: {s['llm_batch_size']}"); st.dataframe(rows)
             if rows:
                 st.write(f"Max dimensions envoyées : {max(r['width'] for r in rows)}x{max(r['height'] for r in rows)}; Plus grand côté max : {max(r['largest_side'] for r in rows)} px; Payload base64 max par batch : {max(sum(x['base64_kb'] for x in rows if x['batch_id']==b) for b in set(r['batch_id'] for r in rows)):.1f} Ko")
         with st.expander("Paramètres Ollama actifs"): st.json(ollama_options(s))
+        st.subheader("Consignes envoyées au LLM")
+        st.caption("Ces consignes sont modifiables. Les timestamps, le transcript ou les résumés sont ajoutés automatiquement au moment de chaque appel.")
+        prompt_a = st.text_area("Consignes A — Images seules", key="analysis_prompt_a", height=130)
+        prompt_b = st.text_area("Consignes B — Chaque partie du transcript", key="analysis_prompt_b", height=130)
+        prompt_b_summary = st.text_area("Consignes B — Synthèse finale (si plusieurs parties)", key="analysis_prompt_b_summary", height=130)
+        prompt_c = st.text_area("Consignes C — Images + transcript", key="analysis_prompt_c", height=130)
+
+        run_all = st.button("Enchaîner A → B → C", type="primary",
+                            help="Exécute successivement les trois analyses avec les consignes affichées ci-dessus.")
+        if run_all:
+            try:
+                task = ProgressReporter(progress_slot, "Étape 1/3 — Analyse A")
+                st.session_state.analysis_a = run_analysis_a(thumbs, s, prompt_a, task)
+                task.complete("Étape 1/3 terminée")
+                task = ProgressReporter(progress_slot, "Étape 2/3 — Analyse B")
+                st.session_state.analysis_b = run_analysis_b(transcript, s, prompt_b, prompt_b_summary, task)
+                task.complete("Étape 2/3 terminée")
+                task = ProgressReporter(progress_slot, "Étape 3/3 — Analyse C")
+                st.session_state.analysis_c = run_analysis_c(thumbs, transcript, s, prompt_c, task)
+                task.complete("Les analyses A, B et C sont terminées")
+                st.success("Les trois étapes A → B → C ont été exécutées.")
+            except OllamaError as e:
+                task.fail(str(e)); st.error(str(e))
         if st.button("A — Images seules"):
             task = ProgressReporter(progress_slot, "Analyse A — Images seules")
             try:
-                res=[]; batches = chunks_list(thumbs, s["llm_batch_size"])
-                for batch_number, part in enumerate(batches, 1):
-                    task.update((batch_number - 1) / max(1, len(batches)), f"Lot {batch_number}/{len(batches)} envoyé au LLM")
-                    prompt=common_prompt(s)+"\nDécris ce que l’on comprend uniquement par les images: lieux, personnes, objets, gestes, émotions, textes visibles, limites sans audio/transcript. Timestamps: "+", ".join(f"#{t.index}={t.timestamp_sec:.2f}s" for t in part)
-                    res.append(ollama_chat_vision(prompt, part, s, s["thumbnail_jpeg_quality"]))
-                st.session_state.analysis_a="\n\n".join(res)
+                st.session_state.analysis_a=run_analysis_a(thumbs, s, prompt_a, task)
                 task.complete("Analyse A terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         if st.button("B — Transcript seul"):
             task = ProgressReporter(progress_slot, "Analyse B — Transcript seul")
             try:
-                parts=[]; transcript_parts = chunks(transcript, int(s["transcript_context_max_chars"]))
-                for part_number, c in enumerate(transcript_parts, 1):
-                    task.update((part_number - 1) / (len(transcript_parts) + 1), f"Partie {part_number}/{len(transcript_parts)} analysée")
-                    parts.append(ollama_generate(common_prompt(s)+"\nRésume en français ce transcript, sujets, intentions, émotions, contexte probable, ambiguïtés nécessitant l’image.\n"+c, s))
-                if len(parts)>1: task.update(len(parts) / (len(parts) + 1), "Synthèse des parties")
-                st.session_state.analysis_b=ollama_generate(common_prompt(s)+"\nFais une synthèse finale en français de ces résumés:\n"+"\n".join(parts), s) if len(parts)>1 else parts[0]
+                st.session_state.analysis_b=run_analysis_b(transcript, s, prompt_b, prompt_b_summary, task)
                 task.complete("Analyse B terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         if st.button("C — Images + transcript"):
             task = ProgressReporter(progress_slot, "Analyse C — Images + transcript")
             try:
-                ctx=build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"])); res=[]; batches = chunks_list(thumbs, s["llm_batch_size"])
-                for batch_number, part in enumerate(batches, 1):
-                    task.update((batch_number - 1) / max(1, len(batches)), f"Lot {batch_number}/{len(batches)} envoyé au LLM")
-                    prompt=common_prompt(s)+"\nExplique ce que le transcript permet de comprendre, ce que les images ajoutent, si elles changent l'interprétation ou n'ajoutent presque rien, puis conclus.\nTranscript réduit:\n"+ctx
-                    res.append(ollama_chat_vision(prompt, part, s, s["thumbnail_jpeg_quality"]))
-                st.session_state.analysis_c="\n\n".join(res)
+                st.session_state.analysis_c=run_analysis_c(thumbs, transcript, s, prompt_c, task)
                 task.complete("Analyse C terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         for key,label in [("analysis_a","A"),("analysis_b","B"),("analysis_c","C")]: st.text_area(label, st.session_state.get(key,""), height=180)
