@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+ollama_protocol_tests/
+video_llm_lab_runs/
+video_llm_lab_settings.json
