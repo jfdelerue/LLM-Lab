@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -43,6 +43,34 @@ class OllamaError(RuntimeError):
 
 class TranscriptionError(RuntimeError):
     pass
+
+
+ProgressCallback = Callable[[float, str], None]
+
+
+class ProgressReporter:
+    """Render one task progress bar in the page-level placeholder."""
+
+    def __init__(self, placeholder: Any, label: str) -> None:
+        self.placeholder = placeholder
+        self.label = label
+        self.update(0.0, "Démarrage…")
+
+    def update(self, fraction: float, detail: str = "") -> None:
+        percent = max(0, min(100, round(fraction * 100)))
+        self.placeholder.empty()
+        with self.placeholder.container():
+            st.caption(f"**{self.label}** — {detail or f'{percent} %'}")
+            st.progress(percent, text=f"{percent} %")
+
+    def complete(self, detail: str = "Terminé") -> None:
+        self.update(1.0, detail)
+
+    def fail(self, detail: str) -> None:
+        self.placeholder.empty()
+        with self.placeholder.container():
+            st.error(f"{self.label} — {detail}")
+            st.progress(0, text="Interrompu")
 
 
 def default_settings() -> dict[str, Any]:
@@ -116,7 +144,8 @@ def save_jpeg(frame: np.ndarray, path: Path, quality: int, largest_side: int) ->
     return Thumbnail(0, 0.0, path, w, h, path.stat().st_size)
 
 
-def extract_thumbnails(video_path: Path, out_dir: Path, interval: float, max_frames: int, largest_side: int, quality: int) -> list[Thumbnail]:
+def extract_thumbnails(video_path: Path, out_dir: Path, interval: float, max_frames: int, largest_side: int, quality: int,
+                       progress: ProgressCallback | None = None) -> list[Thumbnail]:
     cap = cv2.VideoCapture(str(video_path)); meta = video_metadata(video_path)
     thumbs = []
     for i in range(max_frames):
@@ -126,12 +155,15 @@ def extract_thumbnails(video_path: Path, out_dir: Path, interval: float, max_fra
         if frame is None: break
         p = out_dir / f"thumb_{i+1:06d}_{ts:.2f}s.jpg"
         t = save_jpeg(frame, p, quality, largest_side); t.index = i + 1; t.timestamp_sec = ts; thumbs.append(t)
+        if progress: progress((i + 1) / max_frames, f"Vignette {i + 1}/{max_frames}")
     cap.release(); return thumbs
 
 
-def extract_keyframes(video_path: Path, selected: list[dict[str, Any]], out_dir: Path, max_items: int, largest_side: int, quality: int, before: float, after: float) -> list[Thumbnail]:
+def extract_keyframes(video_path: Path, selected: list[dict[str, Any]], out_dir: Path, max_items: int, largest_side: int, quality: int, before: float, after: float,
+                      progress: ProgressCallback | None = None) -> list[Thumbnail]:
     cap = cv2.VideoCapture(str(video_path)); out=[]; seen=set(); idx=1
-    for item in selected[:max_items]:
+    selected_items = selected[:max_items]
+    for item_number, item in enumerate(selected_items, 1):
         ts0 = float(item.get("timestamp_sec", 0))
         for ts in [ts0 - before, ts0, ts0 + after]:
             ts = max(0.0, ts)
@@ -141,6 +173,7 @@ def extract_keyframes(video_path: Path, selected: list[dict[str, Any]], out_dir:
             if frame is None: continue
             p = out_dir / f"keyframe_{idx:06d}_{ts:.2f}s.jpg"
             t = save_jpeg(frame, p, quality, largest_side); t.index=idx; t.timestamp_sec=ts; out.append(t); idx += 1
+        if progress: progress(item_number / max(1, len(selected_items)), f"Sélection {item_number}/{len(selected_items)}")
     cap.release(); return out
 
 
@@ -317,14 +350,17 @@ def ollama_generate_with_retry(prompt: str, s: dict[str, Any], retry_instruction
     retry = ollama_generate(retry_prompt, s)
     return retry if retry.strip() else response
 
-def transcribe_video(path: Path, s: dict[str, Any]) -> str:
+def transcribe_video(path: Path, s: dict[str, Any], progress: ProgressCallback | None = None) -> str:
     def run(device, compute):
+        if progress: progress(0.1, f"Chargement de Whisper ({device})")
         model=WhisperModel(s["whisper_model_size"], device=device, compute_type=compute)
+        if progress: progress(0.25, "Modèle chargé, transcription en cours")
         segs,_=model.transcribe(str(path), language=s["whisper_language"] or None)
-        lines=[]
+        lines=[]; duration = video_metadata(path)["duration_sec"]
         for seg in segs:
             text=re.sub(r"\s+", " ", seg.text).strip()
             if text: lines.append(f"[{fmt_ts(seg.start)} → {fmt_ts(seg.end)}] {text}")
+            if progress and duration: progress(0.25 + 0.7 * min(1.0, seg.end / duration), f"Transcription à {fmt_ts(seg.end)}")
         return "\n".join(lines)
     device = "cuda" if s["whisper_device"] == "cuda" else "cpu" if s["whisper_device"] == "cpu" else "auto"
     try: return run(device, s["whisper_compute_type"])
@@ -393,6 +429,8 @@ def main() -> None:
     st.set_page_config(page_title="Video LLM Lab Ollama", layout="wide")
     s=sidebar(); RUNS_DIR.mkdir(exist_ok=True); PROTOCOL_RUNS_DIR.mkdir(exist_ok=True)
     st.title("Video LLM Lab local avec Ollama")
+    # Declared before the tabs so every long-running task reports at the top of the page.
+    progress_slot = st.empty()
     st.info("Même si les images envoyées sont très petites, Qwen2.5-VL peut les normaliser en interne vers une taille minimale de traitement. Si l’analyse échoue, réduire les images par appel, la taille du transcript ou le nombre de keyframes, et ajuster num_ctx selon l'erreur.")
     tabs=st.tabs(["1. Chargement vidéo","2. Paramètres","3. Extraction des vignettes","4. Transcript","5. Analyse LLM A/B/C","6. Two-pass keyframes","7. Comparaison","8. Diagnostic Ollama","9. Test protocole LLM"])
     with tabs[0]:
@@ -422,15 +460,23 @@ def main() -> None:
         s["two_pass_context_after_sec"] = st.number_input("Contexte après (s)", 0.0, 60.0, float(s["two_pass_context_after_sec"]), 0.5)
     with tabs[2]:
         if st.button("Extraire les vignettes") and st.session_state.get("video_path"):
-            out=Path(st.session_state.video_path).parent / "thumbs"; shutil.rmtree(out, ignore_errors=True)
-            st.session_state.thumbnails=extract_thumbnails(Path(st.session_state.video_path), out, s["thumbnail_interval_sec"], s["thumbnail_max_frames"], s["thumbnail_largest_side_px"], s["thumbnail_jpeg_quality"])
+            task = ProgressReporter(progress_slot, "Extraction des vignettes")
+            try:
+                out=Path(st.session_state.video_path).parent / "thumbs"; shutil.rmtree(out, ignore_errors=True)
+                st.session_state.thumbnails=extract_thumbnails(Path(st.session_state.video_path), out, s["thumbnail_interval_sec"], s["thumbnail_max_frames"], s["thumbnail_largest_side_px"], s["thumbnail_jpeg_quality"], task.update)
+                task.complete(f"{len(st.session_state.thumbnails)} vignette(s) extraite(s)")
+            except Exception as exc:
+                task.fail(str(exc)); st.error(str(exc))
         thumbs=st.session_state.get("thumbnails", [])
         st.write(f"{len(thumbs)} vignettes")
         for t in thumbs[:s["thumbnail_gallery_max_items"]]: st.image(str(t.path), width=s["thumbnail_gallery_display_width"], caption=f"#{t.index} {t.timestamp_sec:.2f}s {t.width}×{t.height} {t.jpeg_bytes/1024:.1f} Ko")
     with tabs[3]:
         if st.button("Transcrire avec faster-whisper") and st.session_state.get("video_path"):
-            try: st.session_state.transcript=transcribe_video(Path(st.session_state.video_path), s)
-            except TranscriptionError as e: st.error(str(e))
+            task = ProgressReporter(progress_slot, "Transcription")
+            try:
+                st.session_state.transcript=transcribe_video(Path(st.session_state.video_path), s, task.update)
+                task.complete("Transcript terminé")
+            except TranscriptionError as e: task.fail(str(e)); st.error(str(e))
         st.text_area("Transcript nettoyé", st.session_state.get("transcript",""), height=400)
     with tabs[4]:
         thumbs=st.session_state.get("thumbnails", []); transcript=st.session_state.get("transcript", "")
@@ -441,59 +487,83 @@ def main() -> None:
                 st.write(f"Max dimensions envoyées : {max(r['width'] for r in rows)}x{max(r['height'] for r in rows)}; Plus grand côté max : {max(r['largest_side'] for r in rows)} px; Payload base64 max par batch : {max(sum(x['base64_kb'] for x in rows if x['batch_id']==b) for b in set(r['batch_id'] for r in rows)):.1f} Ko")
         with st.expander("Paramètres Ollama actifs"): st.json(ollama_options(s))
         if st.button("A — Images seules"):
+            task = ProgressReporter(progress_slot, "Analyse A — Images seules")
             try:
-                res=[]
-                for part in chunks_list(thumbs, s["llm_batch_size"]):
+                res=[]; batches = chunks_list(thumbs, s["llm_batch_size"])
+                for batch_number, part in enumerate(batches, 1):
+                    task.update((batch_number - 1) / max(1, len(batches)), f"Lot {batch_number}/{len(batches)} envoyé au LLM")
                     prompt=common_prompt(s)+"\nDécris ce que l’on comprend uniquement par les images: lieux, personnes, objets, gestes, émotions, textes visibles, limites sans audio/transcript. Timestamps: "+", ".join(f"#{t.index}={t.timestamp_sec:.2f}s" for t in part)
                     res.append(ollama_chat_vision(prompt, part, s, s["thumbnail_jpeg_quality"]))
                 st.session_state.analysis_a="\n\n".join(res)
-            except OllamaError as e: st.error(str(e))
+                task.complete("Analyse A terminée")
+            except OllamaError as e: task.fail(str(e)); st.error(str(e))
         if st.button("B — Transcript seul"):
+            task = ProgressReporter(progress_slot, "Analyse B — Transcript seul")
             try:
-                parts=[]
-                for c in chunks(transcript, int(s["transcript_context_max_chars"])):
+                parts=[]; transcript_parts = chunks(transcript, int(s["transcript_context_max_chars"]))
+                for part_number, c in enumerate(transcript_parts, 1):
+                    task.update((part_number - 1) / (len(transcript_parts) + 1), f"Partie {part_number}/{len(transcript_parts)} analysée")
                     parts.append(ollama_generate(common_prompt(s)+"\nRésume en français ce transcript, sujets, intentions, émotions, contexte probable, ambiguïtés nécessitant l’image.\n"+c, s))
+                if len(parts)>1: task.update(len(parts) / (len(parts) + 1), "Synthèse des parties")
                 st.session_state.analysis_b=ollama_generate(common_prompt(s)+"\nFais une synthèse finale en français de ces résumés:\n"+"\n".join(parts), s) if len(parts)>1 else parts[0]
-            except OllamaError as e: st.error(str(e))
+                task.complete("Analyse B terminée")
+            except OllamaError as e: task.fail(str(e)); st.error(str(e))
         if st.button("C — Images + transcript"):
+            task = ProgressReporter(progress_slot, "Analyse C — Images + transcript")
             try:
-                ctx=build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"])); res=[]
-                for part in chunks_list(thumbs, s["llm_batch_size"]):
+                ctx=build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"])); res=[]; batches = chunks_list(thumbs, s["llm_batch_size"])
+                for batch_number, part in enumerate(batches, 1):
+                    task.update((batch_number - 1) / max(1, len(batches)), f"Lot {batch_number}/{len(batches)} envoyé au LLM")
                     prompt=common_prompt(s)+"\nExplique ce que le transcript permet de comprendre, ce que les images ajoutent, si elles changent l'interprétation ou n'ajoutent presque rien, puis conclus.\nTranscript réduit:\n"+ctx
                     res.append(ollama_chat_vision(prompt, part, s, s["thumbnail_jpeg_quality"]))
                 st.session_state.analysis_c="\n\n".join(res)
-            except OllamaError as e: st.error(str(e))
+                task.complete("Analyse C terminée")
+            except OllamaError as e: task.fail(str(e)); st.error(str(e))
         for key,label in [("analysis_a","A"),("analysis_b","B"),("analysis_c","C")]: st.text_area(label, st.session_state.get(key,""), height=180)
     with tabs[5]:
         thumbs=st.session_state.get("thumbnails", []); transcript=st.session_state.get("transcript", "")
         st.subheader("D1 — Sélectionner les keyframes")
         if st.button("Sélectionner les keyframes"):
+            task = ProgressReporter(progress_slot, "Sélection des keyframes")
             try:
+                task.update(0.15, "Envoi des vignettes au LLM")
                 prompt=common_prompt(s)+"""\nTu reçois une série de vignettes basse résolution extraites chronologiquement d’une vidéo. Ton rôle n’est pas encore de décrire toute la vidéo. Ton rôle est de choisir les images qui méritent une deuxième analyse en meilleure résolution. Sélectionne les images importantes pour comprendre la personne, le lieu, les objets, gestes, émotions, texte visible, changements de scène, moments où l’image ajoute du contexte au transcript. Retourne uniquement un JSON valide au format {\"selected_keyframes\":[{\"frame_index\":12,\"timestamp_sec\":34.5,\"priority\":\"high\",\"reason\":\"...\",\"suggested_focus\":\"...\"}]}\nTranscript réduit:\n"""+build_reduced_transcript_context(transcript, 3000)
                 raw=ollama_chat_vision(prompt, thumbs, s, s["thumbnail_jpeg_quality"]); st.session_state.keyframe_raw=raw; st.session_state.keyframe_json=extract_json_from_text(raw) or {}
-            except OllamaError as e: st.error(str(e))
+                task.complete("Keyframes sélectionnées")
+            except OllamaError as e: task.fail(str(e)); st.error(str(e))
         st.text_area("Réponse D1", st.session_state.get("keyframe_raw",""), height=160); st.json(st.session_state.get("keyframe_json",{}))
         st.subheader("D2 — Extraire les keyframes en meilleure qualité")
         if st.button("Extraire keyframes HQ") and st.session_state.get("video_path"):
-            selected=st.session_state.get("keyframe_json",{}).get("selected_keyframes",[])
-            st.session_state.keyframes_hq=extract_keyframes(Path(st.session_state.video_path), selected, Path(st.session_state.video_path).parent/"keyframes", s["two_pass_max_keyframes"], s["two_pass_high_quality_largest_side_px"], s["two_pass_high_quality_jpeg_quality"], s["two_pass_context_before_sec"], s["two_pass_context_after_sec"])
+            task = ProgressReporter(progress_slot, "Extraction des keyframes HQ")
+            try:
+                selected=st.session_state.get("keyframe_json",{}).get("selected_keyframes",[])
+                st.session_state.keyframes_hq=extract_keyframes(Path(st.session_state.video_path), selected, Path(st.session_state.video_path).parent/"keyframes", s["two_pass_max_keyframes"], s["two_pass_high_quality_largest_side_px"], s["two_pass_high_quality_jpeg_quality"], s["two_pass_context_before_sec"], s["two_pass_context_after_sec"], task.update)
+                task.complete(f"{len(st.session_state.keyframes_hq)} keyframe(s) extraite(s)")
+            except Exception as exc:
+                task.fail(str(exc)); st.error(str(exc))
         for t in st.session_state.get("keyframes_hq",[]): st.image(str(t.path), width=s["thumbnail_gallery_display_width"], caption=f"#{t.index} {t.timestamp_sec:.2f}s {t.width}×{t.height} JPEG {t.jpeg_bytes/1024:.1f} Ko base64 {len(base64.b64encode(t.path.read_bytes()))/1024:.1f} Ko")
         st.subheader("D3 — Décrire les keyframes haute qualité")
         if st.button("Analyser keyframes HQ"):
+            task = ProgressReporter(progress_slot, "Analyse D — Keyframes HQ")
             try:
+                task.update(0.15, "Envoi des keyframes au LLM")
                 prompt=common_prompt(s)+"\nAnalyse ces keyframes haute résolution. Pour chaque keyframe: timestamp, ce que l’image montre, ce que l’image ajoute au transcript, changement d’interprétation, détails visuels, texte visible, utilité faible/moyen/fort. Termine par une synthèse.\nRaisons de sélection:\n"+json.dumps(st.session_state.get("keyframe_json",{}), ensure_ascii=False)+"\nTranscript réduit:\n"+build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"]))
                 st.session_state.analysis_d=ollama_chat_vision(prompt, st.session_state.get("keyframes_hq",[]), s, s["two_pass_high_quality_jpeg_quality"])
-            except OllamaError as e: st.error(str(e))
+                task.complete("Analyse D terminée")
+            except OllamaError as e: task.fail(str(e)); st.error(str(e))
         st.text_area("D — Two-pass keyframes", st.session_state.get("analysis_d",""), height=240)
     with tabs[6]:
         if st.button("Comparer A/B/C/D"):
+            task = ProgressReporter(progress_slot, "Comparaison A/B/C/D")
             try:
+                task.update(0.15, "Génération de la synthèse finale")
                 analyses={"A": st.session_state.get("analysis_a", ""), "B": st.session_state.get("analysis_b", ""), "C": st.session_state.get("analysis_c", ""), "D": st.session_state.get("analysis_d", "")}
                 prompt=build_comparison_prompt(s, analyses)
                 st.session_state.comparison=ollama_generate_with_retry(prompt, s, "Réécris une comparaison complète en français, sans commencer par un titre Markdown isolé.")
                 if is_placeholder_llm_response(st.session_state.comparison):
                     st.warning("La réponse Ollama semble encore incomplète. Augmente num_predict et/ou réduis Transcript max chars, puis relance la comparaison.")
-            except OllamaError as e: st.error(str(e))
+                task.complete("Comparaison terminée")
+            except OllamaError as e: task.fail(str(e)); st.error(str(e))
         st.text_area("Comparaison finale", st.session_state.get("comparison",""), height=400)
     with tabs[7]:
         st.json({"options": ollama_options(s), "base_url": s["ollama_base_url"], "model": s["ollama_model"]})
