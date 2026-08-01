@@ -6,6 +6,8 @@ import os
 import re
 import shutil
 import tempfile
+import hashlib
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ MIN_IMAGE_LARGEST_SIDE_PX = 32
 DEFAULT_THUMBNAIL_LARGEST_SIDE_PX = 400
 MAX_THUMBNAIL_LARGEST_SIDE_PX = 1600
 RUNS_DIR = Path("video_llm_lab_runs")
+PROTOCOL_RUNS_DIR = Path("ollama_protocol_tests")
 SETTINGS_PATH = Path(os.environ.get("VIDEO_LLM_LAB_SETTINGS", "video_llm_lab_settings.json"))
 
 
@@ -166,6 +169,71 @@ def raise_ollama_error(response: requests.Response, context: str) -> None:
     raise OllamaError(f"{context}\nHTTP {response.status_code}\nRéponse Ollama:\n{response.text[:3000]}")
 
 
+def ollama_list_models(base_url: str, timeout: float = 5) -> list[str]:
+    """Return locally installed Ollama model names in server order."""
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
+    except requests.RequestException as exc:
+        raise OllamaError(f"Ollama inaccessible: {exc}") from exc
+    if not response.ok:
+        raise_ollama_error(response, "Échec du scan des modèles Ollama (/api/tags)")
+    try:
+        return [model["name"] for model in response.json().get("models", []) if model.get("name")]
+    except (TypeError, ValueError) as exc:
+        raise OllamaError("Réponse /api/tags invalide.") from exc
+
+
+def redact_images(value: Any) -> Any:
+    """Keep a useful, compact trace without duplicating large base64 images."""
+    if isinstance(value, dict):
+        return {key: ([{"base64_bytes": len(item), "sha256": hashlib.sha256(item.encode()).hexdigest()} for item in child]
+                      if key == "images" and isinstance(child, list) else redact_images(child))
+                for key, child in value.items()}
+    if isinstance(value, list):
+        return [redact_images(item) for item in value]
+    return value
+
+
+def ollama_protocol_test(endpoint: str, prompt: str, s: dict[str, Any], images: list[str] | None = None) -> dict[str, Any]:
+    """Call Ollama without normalising its answer and build a reproducible trace."""
+    if endpoint == "chat":
+        message: dict[str, Any] = {"role": "user", "content": prompt}
+        if images:
+            message["images"] = images
+        payload = {"model": s["ollama_model"], "messages": [message], "stream": False,
+                   "options": ollama_options(s)}
+    else:
+        payload = {"model": s["ollama_model"], "prompt": prompt, "stream": False,
+                   "options": ollama_options(s)}
+        if images:
+            payload["images"] = images
+    url = f"{s['ollama_base_url'].rstrip('/')}/api/{endpoint}"
+    started = datetime.now(timezone.utc)
+    try:
+        response = requests.post(url, json=payload, timeout=900)
+    except requests.RequestException as exc:
+        raise OllamaError(f"Échec du test de protocole: {exc}") from exc
+    finished = datetime.now(timezone.utc)
+    try:
+        parsed_response: Any = response.json()
+    except ValueError:
+        parsed_response = None
+    report = {
+        "schema_version": 1,
+        "started_at": started.isoformat(),
+        "duration_ms": round((finished - started).total_seconds() * 1000, 3),
+        "ollama": {"url": url, "endpoint": endpoint, "model": s["ollama_model"]},
+        "request": redact_images(payload),
+        "http": {"status_code": response.status_code, "headers": dict(response.headers)},
+        # Both forms matter when investigating model-specific <think> markers or fields.
+        "response_json": parsed_response,
+        "response_raw": response.text,
+    }
+    if not response.ok:
+        report["error"] = "Réponse HTTP Ollama non réussie"
+    return report
+
+
 def ollama_options(s: dict[str, Any]) -> dict[str, Any]:
     return {"num_ctx": s["ollama_num_ctx"], "num_predict": s["ollama_num_predict"], "temperature": s["ollama_temperature"], "top_p": s["ollama_top_p"], "num_batch": s["ollama_num_batch"]}
 
@@ -281,7 +349,28 @@ def sidebar() -> dict[str, Any]:
     st.sidebar.header("Paramètres")
     for k,v in default_settings().items(): s.setdefault(k,v)
     s["ollama_base_url"] = st.sidebar.text_input("Ollama URL", s["ollama_base_url"])
-    s["ollama_model"] = st.sidebar.text_input("Modèle Ollama", s["ollama_model"])
+    scan_key = f"ollama_models::{s['ollama_base_url']}"
+    if scan_key not in st.session_state:
+        try:
+            st.session_state[scan_key] = {"models": ollama_list_models(s["ollama_base_url"]), "error": ""}
+        except OllamaError as exc:
+            st.session_state[scan_key] = {"models": [], "error": str(exc)}
+    scan = st.session_state[scan_key]
+    if st.sidebar.button("Actualiser les modèles Ollama"):
+        try:
+            scan = {"models": ollama_list_models(s["ollama_base_url"]), "error": ""}
+        except OllamaError as exc:
+            scan = {"models": [], "error": str(exc)}
+        st.session_state[scan_key] = scan
+    models = scan["models"]
+    if models:
+        choices = models if s["ollama_model"] in models else [s["ollama_model"], *models]
+        s["ollama_model"] = st.sidebar.selectbox("Modèle Ollama installé", choices,
+                                                   index=choices.index(s["ollama_model"]))
+        st.sidebar.caption(f"{len(models)} modèle(s) détecté(s) au démarrage.")
+    else:
+        s["ollama_model"] = st.sidebar.text_input("Modèle Ollama", s["ollama_model"])
+        st.sidebar.warning(scan["error"] or "Aucun modèle installé détecté.")
     with st.sidebar.expander("Ollama — paramètres avancés", expanded=True):
         s["ollama_num_ctx"] = st.number_input("num_ctx", 512, 262144, int(s["ollama_num_ctx"]), 1)
         s["ollama_num_predict"] = st.number_input("num_predict", 1, 32768, int(s["ollama_num_predict"]), 1)
@@ -302,10 +391,10 @@ def sidebar() -> dict[str, Any]:
 
 def main() -> None:
     st.set_page_config(page_title="Video LLM Lab Ollama", layout="wide")
-    s=sidebar(); RUNS_DIR.mkdir(exist_ok=True)
+    s=sidebar(); RUNS_DIR.mkdir(exist_ok=True); PROTOCOL_RUNS_DIR.mkdir(exist_ok=True)
     st.title("Video LLM Lab local avec Ollama")
     st.info("Même si les images envoyées sont très petites, Qwen2.5-VL peut les normaliser en interne vers une taille minimale de traitement. Si l’analyse échoue, réduire les images par appel, la taille du transcript ou le nombre de keyframes, et ajuster num_ctx selon l'erreur.")
-    tabs=st.tabs(["1. Chargement vidéo","2. Paramètres","3. Extraction des vignettes","4. Transcript","5. Analyse LLM A/B/C","6. Two-pass keyframes","7. Comparaison","8. Diagnostic Ollama"])
+    tabs=st.tabs(["1. Chargement vidéo","2. Paramètres","3. Extraction des vignettes","4. Transcript","5. Analyse LLM A/B/C","6. Two-pass keyframes","7. Comparaison","8. Diagnostic Ollama","9. Test protocole LLM"])
     with tabs[0]:
         f=st.file_uploader("Charger une vidéo", type=["mp4","mov","mkv","avi","webm"])
         if f:
@@ -420,6 +509,39 @@ def main() -> None:
             tmp=Path(tempfile.gettempdir())/"ollama_vision_test.jpg"; cv2.imwrite(str(tmp), img); t=Thumbnail(1,0,tmp,420,120,tmp.stat().st_size)
             try: st.success(ollama_chat_vision("Lis le texte visible dans cette image.", [t], s, 90))
             except OllamaError as e: st.error(str(e))
+    with tabs[8]:
+        st.subheader("Capturer la réponse brute d’un modèle")
+        st.write("Ce test conserve séparément le JSON décodé et la réponse HTTP brute afin d’identifier, pour chaque modèle, les champs ou marqueurs tels que `<think>`.")
+        protocol_endpoint = st.radio("API à tester", ["chat", "generate"], horizontal=True,
+                                     format_func=lambda value: f"/api/{value}")
+        protocol_prompt = st.text_area("Contenu envoyé", "Explique brièvement ton raisonnement puis réponds : combien font 17 × 6 ?", height=140)
+        protocol_image = st.file_uploader("Image optionnelle envoyée au modèle", type=["png", "jpg", "jpeg", "webp"], key="protocol_image")
+        if st.button("Exécuter et enregistrer le test", type="primary"):
+            images = [base64.b64encode(protocol_image.getvalue()).decode("ascii")] if protocol_image else []
+            try:
+                report = ollama_protocol_test(protocol_endpoint, protocol_prompt, s, images)
+                safe_model = re.sub(r"[^a-zA-Z0-9_.-]+", "_", s["ollama_model"])
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+                report_path = PROTOCOL_RUNS_DIR / f"{stamp}_{safe_model}_{protocol_endpoint}.json"
+                report_text = json.dumps(report, ensure_ascii=False, indent=2)
+                report_path.write_text(report_text, encoding="utf-8")
+                st.session_state.protocol_report = report
+                st.session_state.protocol_report_text = report_text
+                st.session_state.protocol_report_path = str(report_path)
+                if report["http"]["status_code"] < 400:
+                    st.success(f"Trace enregistrée dans {report_path}")
+                else:
+                    st.error(f"Ollama a répondu HTTP {report['http']['status_code']}; la trace d’erreur a été conservée.")
+            except OllamaError as exc:
+                st.error(str(exc))
+        report = st.session_state.get("protocol_report")
+        if report:
+            st.caption(f"Modèle: {report['ollama']['model']} · Endpoint: /api/{report['ollama']['endpoint']} · Durée: {report['duration_ms']} ms")
+            st.text_area("Réponse HTTP brute (aucun marqueur supprimé)", report["response_raw"], height=260)
+            st.json(report["response_json"] if report["response_json"] is not None else {"non_json_response": True})
+            st.download_button("Télécharger la trace JSON", st.session_state["protocol_report_text"],
+                               file_name=Path(st.session_state["protocol_report_path"]).name,
+                               mime="application/json")
 
 
 def chunks_list(items: list[Any], n: int) -> list[list[Any]]:
