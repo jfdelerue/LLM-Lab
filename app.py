@@ -505,6 +505,15 @@ def default_analysis_prompts(s: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def default_two_pass_prompts(s: dict[str, Any]) -> dict[str, str]:
+    """Return the editable instructions used by both LLM passes in panel D."""
+    common = common_prompt(s)
+    return {
+        "analysis_prompt_d1": common + "\nTu reçois une série de vignettes basse résolution extraites chronologiquement d’une vidéo. Ton rôle n’est pas encore de décrire toute la vidéo. Ton rôle est de choisir les images qui méritent une deuxième analyse en meilleure résolution. Sélectionne les images importantes pour comprendre la personne, le lieu, les objets, gestes, émotions, texte visible, changements de scène, moments où l’image ajoute du contexte au transcript. Retourne uniquement un JSON valide au format {\"selected_keyframes\":[{\"frame_index\":12,\"timestamp_sec\":34.5,\"priority\":\"high\",\"reason\":\"...\",\"suggested_focus\":\"...\"}]}",
+        "analysis_prompt_d3": common + "\nAnalyse ces keyframes haute résolution. Pour chaque keyframe: timestamp, ce que l’image montre, ce que l’image ajoute au transcript, changement d’interprétation, détails visuels, texte visible, utilité faible/moyen/fort. Termine par une synthèse.",
+    }
+
+
 def run_analysis_a(thumbs: list[Thumbnail], s: dict[str, Any], instruction: str,
                    task: ProgressReporter, request_log: list[dict[str, Any]] | None = None) -> str:
     if not thumbs:
@@ -746,13 +755,26 @@ def main() -> None:
                 render_llm_logs(logs, f"cas {label}")
     with tabs[5]:
         thumbs=st.session_state.get("thumbnails", []); transcript=st.session_state.get("transcript", "")
+        for key, value in default_two_pass_prompts(s).items():
+            st.session_state.setdefault(key, value)
+        st.subheader("Consignes envoyées au LLM")
+        st.caption(
+            "Comme pour A/B/C, ces consignes sont modifiables. Le transcript réduit et, pour D3, "
+            "les raisons de sélection sont ajoutés automatiquement à l’appel."
+        )
+        prompt_d1 = st.text_area(
+            "Consignes D1 — Sélection des keyframes", key="analysis_prompt_d1", height=180
+        )
+        prompt_d3 = st.text_area(
+            "Consignes D3 — Analyse des keyframes HQ", key="analysis_prompt_d3", height=150
+        )
         st.subheader("D1 — Sélectionner les keyframes")
         if st.button("Sélectionner les keyframes"):
             task = ProgressReporter(progress_slot, "Sélection des keyframes")
             try:
                 st.session_state.analysis_log_d1 = []
                 task.update(0.15, "Envoi des vignettes au LLM")
-                prompt=common_prompt(s)+"""\nTu reçois une série de vignettes basse résolution extraites chronologiquement d’une vidéo. Ton rôle n’est pas encore de décrire toute la vidéo. Ton rôle est de choisir les images qui méritent une deuxième analyse en meilleure résolution. Sélectionne les images importantes pour comprendre la personne, le lieu, les objets, gestes, émotions, texte visible, changements de scène, moments où l’image ajoute du contexte au transcript. Retourne uniquement un JSON valide au format {\"selected_keyframes\":[{\"frame_index\":12,\"timestamp_sec\":34.5,\"priority\":\"high\",\"reason\":\"...\",\"suggested_focus\":\"...\"}]}\nTranscript réduit:\n"""+build_reduced_transcript_context(transcript, 3000)
+                prompt=prompt_d1+"\nTranscript réduit:\n"+build_reduced_transcript_context(transcript, 3000)
                 raw=ollama_chat_vision(prompt, thumbs, s, s["thumbnail_jpeg_quality"], st.session_state.analysis_log_d1); st.session_state.keyframe_raw=raw; st.session_state.keyframe_json=extract_json_from_text(raw) or {}
                 task.complete("Keyframes sélectionnées")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
@@ -775,7 +797,7 @@ def main() -> None:
             try:
                 st.session_state.analysis_log_d3 = []
                 task.update(0.15, "Envoi des keyframes au LLM")
-                prompt=common_prompt(s)+"\nAnalyse ces keyframes haute résolution. Pour chaque keyframe: timestamp, ce que l’image montre, ce que l’image ajoute au transcript, changement d’interprétation, détails visuels, texte visible, utilité faible/moyen/fort. Termine par une synthèse.\nRaisons de sélection:\n"+json.dumps(st.session_state.get("keyframe_json",{}), ensure_ascii=False)+"\nTranscript réduit:\n"+build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"]))
+                prompt=prompt_d3+"\nRaisons de sélection:\n"+json.dumps(st.session_state.get("keyframe_json",{}), ensure_ascii=False)+"\nTranscript réduit:\n"+build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"]))
                 st.session_state.analysis_d=ollama_chat_vision(prompt, st.session_state.get("keyframes_hq",[]), s, s["two_pass_high_quality_jpeg_quality"], st.session_state.analysis_log_d3)
                 task.complete("Analyse D terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
