@@ -21,6 +21,7 @@ from faster_whisper import WhisperModel
 MIN_IMAGE_LARGEST_SIDE_PX = 32
 DEFAULT_THUMBNAIL_LARGEST_SIDE_PX = 400
 MAX_THUMBNAIL_LARGEST_SIDE_PX = 1600
+VIDEO_DISPLAY_MAX_WIDTH_PX = 400
 RUNS_DIR = Path("video_llm_lab_runs")
 PROTOCOL_RUNS_DIR = Path("ollama_protocol_tests")
 SETTINGS_PATH = Path(os.environ.get("VIDEO_LLM_LAB_SETTINGS", "video_llm_lab_settings.json"))
@@ -81,7 +82,6 @@ def default_settings() -> dict[str, Any]:
         "thumbnail_largest_side_px": DEFAULT_THUMBNAIL_LARGEST_SIDE_PX, "thumbnail_interval_sec": 2.0,
         "thumbnail_max_frames": 48, "thumbnail_jpeg_quality": 85,
         "thumbnail_gallery_display_width": 400, "thumbnail_gallery_max_items": 24,
-        "video_display_max_side": 400,
         "whisper_model_size": "small", "whisper_device": "auto", "whisper_compute_type": "int8",
         "whisper_language": "ru", "whisper_fallback_cpu": True,
         "analysis_language": "fr", "dialogue_language": "ru",
@@ -592,7 +592,6 @@ def sidebar() -> dict[str, Any]:
         s["ollama_top_p"] = st.number_input("top_p", 0.0, 1.0, float(s["ollama_top_p"]), 0.05)
         s["ollama_num_batch"] = st.number_input("num_batch", 1, 8192, int(s["ollama_num_batch"]), 1)
         st.caption("num_ctx : place disponible pour transcript, timestamps et tokens image. num_predict : longueur maximale. temperature : 0 = déterministe. top_p : diversité. num_batch : mémoire/vitesse.")
-    s["video_display_max_side"] = st.sidebar.number_input("Taille vidéo affichée — plus grand côté max", 32, 2000, int(s["video_display_max_side"]), 1)
     c1,c2,c3=st.sidebar.columns(3)
     if c1.button("Sauver les paramètres"): save_settings(s); st.sidebar.success("Sauvé")
     if c2.button("Recharger les paramètres"): st.session_state.settings=load_settings(); st.rerun()
@@ -616,8 +615,15 @@ def main() -> None:
         if f:
             run=RUNS_DIR / Path(f.name).stem; run.mkdir(parents=True, exist_ok=True); vp=run / f.name; vp.write_bytes(f.getbuffer())
             st.session_state.video_path=str(vp); meta=video_metadata(vp); st.session_state.video_meta=meta; st.json(meta)
-            scale=min(1.0, s["video_display_max_side"] / max(meta["width"], meta["height"]))
-            st.video(str(vp)); st.caption(f"Affichage recommandé sans agrandissement: {int(meta['width']*scale)}×{int(meta['height']*scale)} px")
+            st.markdown(
+                f"""<style>
+                [data-testid="stVideo"] {{ max-width: {VIDEO_DISPLAY_MAX_WIDTH_PX}px; }}
+                [data-testid="stVideo"] video {{ width: 100%; height: auto; }}
+                </style>""",
+                unsafe_allow_html=True,
+            )
+            st.video(str(vp))
+            st.caption(f"Largeur d’affichage maximale : {VIDEO_DISPLAY_MAX_WIDTH_PX} px (ratio conservé)")
     with tabs[1]:
         s["thumbnail_largest_side_px"] = st.number_input("Taille des vignettes — plus grand côté envoyé au LLM (px)", min_value=MIN_IMAGE_LARGEST_SIDE_PX, max_value=MAX_THUMBNAIL_LARGEST_SIDE_PX, value=int(s["thumbnail_largest_side_px"]), step=1)
         s["thumbnail_interval_sec"] = st.number_input("Intervalle extraction (s)", 0.1, 3600.0, float(s["thumbnail_interval_sec"]), 0.1)
