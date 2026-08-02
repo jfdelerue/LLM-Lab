@@ -216,6 +216,31 @@ def ollama_list_models(base_url: str, timeout: float = 5) -> list[str]:
         raise OllamaError("Réponse /api/tags invalide.") from exc
 
 
+def ollama_model_capabilities(base_url: str, model: str, timeout: float = 30) -> list[str]:
+    """Read the capabilities advertised by the installed model via /api/show."""
+    try:
+        response = requests.post(
+            f"{base_url.rstrip('/')}/api/show", json={"model": model}, timeout=timeout
+        )
+    except requests.RequestException as exc:
+        raise OllamaError(f"Impossible d'inspecter le modèle {model}: {exc}") from exc
+    if not response.ok:
+        raise_ollama_error(response, f"Échec de l'inspection de {model} (/api/show)")
+    try:
+        return [str(item) for item in response.json().get("capabilities", [])]
+    except (TypeError, ValueError) as exc:
+        raise OllamaError("Réponse /api/show invalide.") from exc
+
+
+def require_vision_model(s: dict[str, Any]) -> None:
+    capabilities = ollama_model_capabilities(s["ollama_base_url"], s["ollama_model"])
+    if "vision" not in capabilities:
+        raise OllamaError(
+            f"Le modèle {s['ollama_model']} n'annonce pas la capacité « vision » dans /api/show. "
+            "Utilisez ce modèle pour B (texte), ou sélectionnez un modèle vision pour A/C."
+        )
+
+
 def redact_images(value: Any) -> Any:
     """Keep a useful, compact trace without duplicating large base64 images."""
     if isinstance(value, dict):
@@ -271,21 +296,45 @@ def ollama_options(s: dict[str, Any]) -> dict[str, Any]:
     return {"num_ctx": s["ollama_num_ctx"], "num_predict": s["ollama_num_predict"], "temperature": s["ollama_temperature"], "top_p": s["ollama_top_p"], "num_batch": s["ollama_num_batch"]}
 
 
+def append_request_log(request_log: list[dict[str, Any]] | None, endpoint: str,
+                       payload: dict[str, Any]) -> None:
+    if request_log is not None:
+        request_log.append({
+            "url": endpoint,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "payload": redact_images(payload),
+        })
+
+
+def ollama_chat_text(prompt: str, s: dict[str, Any],
+                     request_log: list[dict[str, Any]] | None = None) -> str:
+    """Send text through /api/chat so Ollama applies each model's chat template."""
+    payload = {"model": s["ollama_model"], "messages": [{"role": "user", "content": prompt}],
+               "stream": False, "options": ollama_options(s)}
+    url = f"{s['ollama_base_url'].rstrip('/')}/api/chat"
+    append_request_log(request_log, url, payload)
+    r = requests.post(url, json=payload, timeout=600)
+    if not r.ok: raise_ollama_error(r, "Échec Ollama texte /api/chat")
+    return r.json().get("message", {}).get("content", "")
+
+
 def ollama_generate(prompt: str, s: dict[str, Any]) -> str:
-    r = requests.post(f"{s['ollama_base_url'].rstrip('/')}/api/generate", json={"model": s["ollama_model"], "prompt": prompt, "stream": False, "options": ollama_options(s)}, timeout=600)
-    if not r.ok: raise_ollama_error(r, "Échec Ollama /api/generate")
-    return r.json().get("response", "")
+    """Backward-compatible text helper used outside the A/B/C workflow."""
+    return ollama_chat_text(prompt, s)
 
 
-def ollama_chat_vision(prompt: str, thumbs: list[Thumbnail], s: dict[str, Any], quality: int) -> str:
+def ollama_chat_vision(prompt: str, thumbs: list[Thumbnail], s: dict[str, Any], quality: int,
+                       request_log: list[dict[str, Any]] | None = None) -> str:
     images=[thumbnail_to_ollama_base64(t, quality)[0] for t in thumbs]
     payload={"model": s["ollama_model"], "messages":[{"role":"user","content":prompt,"images":images}], "stream":False, "options":ollama_options(s)}
-    r=requests.post(f"{s['ollama_base_url'].rstrip('/')}/api/chat", json=payload, timeout=900)
+    url=f"{s['ollama_base_url'].rstrip('/')}/api/chat"
+    append_request_log(request_log, url, payload)
+    r=requests.post(url, json=payload, timeout=900)
     if r.ok: return r.json().get("message",{}).get("content","")
     if len(thumbs) > 1:
         parts=[]
         for t in thumbs:
-            parts.append(ollama_chat_vision(prompt + f"\nImage unique: index {t.index}, timestamp {t.timestamp_sec:.2f}s", [t], s, quality))
+            parts.append(ollama_chat_vision(prompt + f"\nImage unique: index {t.index}, timestamp {t.timestamp_sec:.2f}s", [t], s, quality, request_log))
         return "\n\n".join(parts)
     raise_ollama_error(r, "Échec Ollama vision /api/chat")
 
@@ -391,7 +440,9 @@ def default_analysis_prompts(s: dict[str, Any]) -> dict[str, str]:
 
 
 def run_analysis_a(thumbs: list[Thumbnail], s: dict[str, Any], instruction: str,
-                   task: ProgressReporter) -> str:
+                   task: ProgressReporter, request_log: list[dict[str, Any]] | None = None) -> str:
+    if not thumbs:
+        raise OllamaError("Analyse A impossible : extrayez d'abord au moins une vignette.")
     results = []
     batches = chunks_list(thumbs, s["llm_batch_size"])
     for batch_number, part in enumerate(batches, 1):
@@ -399,26 +450,36 @@ def run_analysis_a(thumbs: list[Thumbnail], s: dict[str, Any], instruction: str,
                     f"Lot {batch_number}/{len(batches)} envoyé au LLM")
         timestamps = ", ".join(f"#{t.index}={t.timestamp_sec:.2f}s" for t in part)
         results.append(ollama_chat_vision(f"{instruction}\nTimestamps: {timestamps}", part, s,
-                                          s["thumbnail_jpeg_quality"]))
+                                          s["thumbnail_jpeg_quality"], request_log))
     return "\n\n".join(results)
 
 
 def run_analysis_b(transcript: str, s: dict[str, Any], instruction: str,
-                   summary_instruction: str, task: ProgressReporter) -> str:
+                   summary_instruction: str, task: ProgressReporter,
+                   request_log: list[dict[str, Any]] | None = None) -> str:
+    if not transcript.strip():
+        raise OllamaError("Analyse B impossible : le transcript est vide. Transcrivez la vidéo ou saisissez un transcript.")
     results = []
     transcript_parts = chunks(transcript, int(s["transcript_context_max_chars"]))
     for part_number, part in enumerate(transcript_parts, 1):
         task.update((part_number - 1) / (len(transcript_parts) + 1),
                     f"Partie {part_number}/{len(transcript_parts)} analysée")
-        results.append(ollama_generate(f"{instruction}\n{part}", s))
+        results.append(ollama_chat_text(f"{instruction}\n\nTRANSCRIPT À ANALYSER:\n{part}", s,
+                                        request_log))
     if len(results) == 1:
         return results[0]
     task.update(len(results) / (len(results) + 1), "Synthèse des parties")
-    return ollama_generate(f"{summary_instruction}\n" + "\n".join(results), s)
+    return ollama_chat_text(f"{summary_instruction}\n\nRÉSUMÉS À SYNTHÉTISER:\n" + "\n".join(results), s,
+                            request_log)
 
 
 def run_analysis_c(thumbs: list[Thumbnail], transcript: str, s: dict[str, Any],
-                   instruction: str, task: ProgressReporter) -> str:
+                   instruction: str, task: ProgressReporter,
+                   request_log: list[dict[str, Any]] | None = None) -> str:
+    if not thumbs:
+        raise OllamaError("Analyse C impossible : extrayez d'abord au moins une vignette.")
+    if not transcript.strip():
+        raise OllamaError("Analyse C impossible : le transcript est vide. Transcrivez la vidéo ou saisissez un transcript.")
     context = build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"]))
     results = []
     batches = chunks_list(thumbs, s["llm_batch_size"])
@@ -426,7 +487,7 @@ def run_analysis_c(thumbs: list[Thumbnail], transcript: str, s: dict[str, Any],
         task.update((batch_number - 1) / max(1, len(batches)),
                     f"Lot {batch_number}/{len(batches)} envoyé au LLM")
         prompt = f"{instruction}\nTranscript réduit:\n{context}"
-        results.append(ollama_chat_vision(prompt, part, s, s["thumbnail_jpeg_quality"]))
+        results.append(ollama_chat_vision(prompt, part, s, s["thumbnail_jpeg_quality"], request_log))
     return "\n\n".join(results)
 
 
@@ -528,7 +589,9 @@ def main() -> None:
                 st.session_state.transcript=transcribe_video(Path(st.session_state.video_path), s, task.update)
                 task.complete("Transcript terminé")
             except TranscriptionError as e: task.fail(str(e)); st.error(str(e))
-        st.text_area("Transcript nettoyé", st.session_state.get("transcript",""), height=400)
+        st.session_state.transcript = st.text_area(
+            "Transcript nettoyé (modifiable)", st.session_state.get("transcript", ""), height=400
+        )
     with tabs[4]:
         thumbs=st.session_state.get("thumbnails", []); transcript=st.session_state.get("transcript", "")
         for key, value in default_analysis_prompts(s).items():
@@ -539,6 +602,21 @@ def main() -> None:
             if rows:
                 st.write(f"Max dimensions envoyées : {max(r['width'] for r in rows)}x{max(r['height'] for r in rows)}; Plus grand côté max : {max(r['largest_side'] for r in rows)} px; Payload base64 max par batch : {max(sum(x['base64_kb'] for x in rows if x['batch_id']==b) for b in set(r['batch_id'] for r in rows)):.1f} Ko")
         with st.expander("Paramètres Ollama actifs"): st.json(ollama_options(s))
+        capability_key = f"ollama_capabilities::{s['ollama_base_url']}::{s['ollama_model']}"
+        try:
+            if capability_key not in st.session_state:
+                st.session_state[capability_key] = ollama_model_capabilities(
+                    s["ollama_base_url"], s["ollama_model"]
+                )
+            capabilities = st.session_state[capability_key]
+            st.caption(
+                f"Capacités déclarées par /api/show pour **{s['ollama_model']}** : "
+                + (", ".join(capabilities) or "aucune")
+            )
+            if "vision" not in capabilities:
+                st.warning("Ce modèle est utilisable pour B, mais pas pour A/C qui envoient des images.")
+        except OllamaError as exc:
+            st.warning(str(exc))
         st.subheader("Consignes envoyées au LLM")
         st.caption("Ces consignes sont modifiables. Les timestamps, le transcript ou les résumés sont ajoutés automatiquement au moment de chaque appel.")
         prompt_a = st.text_area("Consignes A — Images seules", key="analysis_prompt_a", height=130)
@@ -550,14 +628,18 @@ def main() -> None:
                             help="Exécute successivement les trois analyses avec les consignes affichées ci-dessus.")
         if run_all:
             try:
+                require_vision_model(s)
+                st.session_state.analysis_log_a = []
+                st.session_state.analysis_log_b = []
+                st.session_state.analysis_log_c = []
                 task = ProgressReporter(progress_slot, "Étape 1/3 — Analyse A")
-                st.session_state.analysis_a = run_analysis_a(thumbs, s, prompt_a, task)
+                st.session_state.analysis_a = run_analysis_a(thumbs, s, prompt_a, task, st.session_state.analysis_log_a)
                 task.complete("Étape 1/3 terminée")
                 task = ProgressReporter(progress_slot, "Étape 2/3 — Analyse B")
-                st.session_state.analysis_b = run_analysis_b(transcript, s, prompt_b, prompt_b_summary, task)
+                st.session_state.analysis_b = run_analysis_b(transcript, s, prompt_b, prompt_b_summary, task, st.session_state.analysis_log_b)
                 task.complete("Étape 2/3 terminée")
                 task = ProgressReporter(progress_slot, "Étape 3/3 — Analyse C")
-                st.session_state.analysis_c = run_analysis_c(thumbs, transcript, s, prompt_c, task)
+                st.session_state.analysis_c = run_analysis_c(thumbs, transcript, s, prompt_c, task, st.session_state.analysis_log_c)
                 task.complete("Les analyses A, B et C sont terminées")
                 st.success("Les trois étapes A → B → C ont été exécutées.")
             except OllamaError as e:
@@ -565,22 +647,32 @@ def main() -> None:
         if st.button("A — Images seules"):
             task = ProgressReporter(progress_slot, "Analyse A — Images seules")
             try:
-                st.session_state.analysis_a=run_analysis_a(thumbs, s, prompt_a, task)
+                require_vision_model(s)
+                st.session_state.analysis_log_a=[]
+                st.session_state.analysis_a=run_analysis_a(thumbs, s, prompt_a, task, st.session_state.analysis_log_a)
                 task.complete("Analyse A terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         if st.button("B — Transcript seul"):
             task = ProgressReporter(progress_slot, "Analyse B — Transcript seul")
             try:
-                st.session_state.analysis_b=run_analysis_b(transcript, s, prompt_b, prompt_b_summary, task)
+                st.session_state.analysis_log_b=[]
+                st.session_state.analysis_b=run_analysis_b(transcript, s, prompt_b, prompt_b_summary, task, st.session_state.analysis_log_b)
                 task.complete("Analyse B terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         if st.button("C — Images + transcript"):
             task = ProgressReporter(progress_slot, "Analyse C — Images + transcript")
             try:
-                st.session_state.analysis_c=run_analysis_c(thumbs, transcript, s, prompt_c, task)
+                require_vision_model(s)
+                st.session_state.analysis_log_c=[]
+                st.session_state.analysis_c=run_analysis_c(thumbs, transcript, s, prompt_c, task, st.session_state.analysis_log_c)
                 task.complete("Analyse C terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
-        for key,label in [("analysis_a","A"),("analysis_b","B"),("analysis_c","C")]: st.text_area(label, st.session_state.get(key,""), height=180)
+        for key,label in [("analysis_a","A"),("analysis_b","B"),("analysis_c","C")]:
+            st.text_area(label, st.session_state.get(key,""), height=180)
+            with st.expander(f"Log exact des requêtes envoyées — cas {label}"):
+                logs = st.session_state.get(f"analysis_log_{label.lower()}", [])
+                st.caption("Le prompt et tous les paramètres sont affichés; les images base64 sont remplacées par leur taille et leur SHA-256.")
+                st.json(logs if logs else {"information": "Aucun appel effectué pendant cette session."})
     with tabs[5]:
         thumbs=st.session_state.get("thumbnails", []); transcript=st.session_state.get("transcript", "")
         st.subheader("D1 — Sélectionner les keyframes")
