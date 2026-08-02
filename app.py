@@ -320,6 +320,33 @@ def complete_request_log(entry: dict[str, Any] | None, response: requests.Respon
         })
 
 
+def ollama_chat_content(response_data: dict[str, Any]) -> str:
+    """Return the final answer, or explain why a thinking model produced none."""
+    message = response_data.get("message") or {}
+    content = message.get("content") or ""
+    if content.strip():
+        return content
+
+    thinking = message.get("thinking") or ""
+    done_reason = response_data.get("done_reason")
+    if thinking.strip() and done_reason == "length":
+        raise OllamaError(
+            "Ollama n’a produit aucune réponse finale : le modèle a consommé toute la limite "
+            "num_predict pendant son raisonnement (done_reason=length). Augmentez num_predict "
+            "dans « Ollama — paramètres avancés », ou réduisez le transcript, puis relancez l’analyse. "
+            "Le raisonnement brut reste consultable dans le log exact de l’appel."
+        )
+    if thinking.strip():
+        raise OllamaError(
+            "Ollama a renvoyé un raisonnement dans message.thinking, mais aucune réponse finale "
+            "dans message.content. Consultez le log exact de l’appel et essayez d’augmenter num_predict."
+        )
+    raise OllamaError(
+        "Ollama a terminé sans texte dans message.content. Consultez le log exact de l’appel "
+        f"(done_reason={done_reason or 'non renseigné'})."
+    )
+
+
 def ollama_chat_text(prompt: str, s: dict[str, Any],
                      request_log: list[dict[str, Any]] | None = None) -> str:
     """Send text through /api/chat so Ollama applies each model's chat template."""
@@ -330,7 +357,7 @@ def ollama_chat_text(prompt: str, s: dict[str, Any],
     r = requests.post(url, json=payload, timeout=600)
     complete_request_log(log_entry, r)
     if not r.ok: raise_ollama_error(r, "Échec Ollama texte /api/chat")
-    return r.json().get("message", {}).get("content", "")
+    return ollama_chat_content(r.json())
 
 
 def ollama_generate(prompt: str, s: dict[str, Any],
@@ -347,7 +374,7 @@ def ollama_chat_vision(prompt: str, thumbs: list[Thumbnail], s: dict[str, Any], 
     log_entry = append_request_log(request_log, url, payload)
     r=requests.post(url, json=payload, timeout=900)
     complete_request_log(log_entry, r)
-    if r.ok: return r.json().get("message",{}).get("content","")
+    if r.ok: return ollama_chat_content(r.json())
     if len(thumbs) > 1:
         parts=[]
         for t in thumbs:
