@@ -1,6 +1,6 @@
 import unittest
 
-from app import OllamaError, ollama_chat_content
+from app import OllamaError, default_settings, default_two_pass_prompts, ollama_chat_content
 
 
 class OllamaChatContentTests(unittest.TestCase):
@@ -24,6 +24,17 @@ class OllamaChatContentTests(unittest.TestCase):
     def test_explains_empty_response_without_thinking(self):
         with self.assertRaisesRegex(OllamaError, "sans texte.*done_reason=stop"):
             ollama_chat_content({"message": {"content": ""}, "done_reason": "stop"})
+
+
+class TwoPassPromptTests(unittest.TestCase):
+    def test_both_two_pass_prompts_are_exposed_with_common_context(self):
+        settings = default_settings()
+        prompts = default_two_pass_prompts(settings)
+
+        self.assertEqual(set(prompts), {"analysis_prompt_d1", "analysis_prompt_d3"})
+        self.assertIn(settings["analysis_objective"], prompts["analysis_prompt_d1"])
+        self.assertIn(settings["analysis_objective"], prompts["analysis_prompt_d3"])
+        self.assertIn("selected_keyframes", prompts["analysis_prompt_d1"])
 
 
 if __name__ == "__main__":
