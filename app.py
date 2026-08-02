@@ -297,12 +297,26 @@ def ollama_options(s: dict[str, Any]) -> dict[str, Any]:
 
 
 def append_request_log(request_log: list[dict[str, Any]] | None, endpoint: str,
-                       payload: dict[str, Any]) -> None:
+                       payload: dict[str, Any]) -> dict[str, Any] | None:
     if request_log is not None:
-        request_log.append({
+        entry = {
             "url": endpoint,
             "sent_at": datetime.now(timezone.utc).isoformat(),
             "payload": redact_images(payload),
+        }
+        request_log.append(entry)
+        return entry
+    return None
+
+
+def complete_request_log(entry: dict[str, Any] | None, response: requests.Response) -> None:
+    """Attach the complete, unmodified HTTP response to an existing request trace."""
+    if entry is not None:
+        entry.update({
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "http_status": response.status_code,
+            "response_headers": dict(response.headers),
+            "response_raw": response.text,
         })
 
 
@@ -312,15 +326,17 @@ def ollama_chat_text(prompt: str, s: dict[str, Any],
     payload = {"model": s["ollama_model"], "messages": [{"role": "user", "content": prompt}],
                "stream": False, "options": ollama_options(s)}
     url = f"{s['ollama_base_url'].rstrip('/')}/api/chat"
-    append_request_log(request_log, url, payload)
+    log_entry = append_request_log(request_log, url, payload)
     r = requests.post(url, json=payload, timeout=600)
+    complete_request_log(log_entry, r)
     if not r.ok: raise_ollama_error(r, "Échec Ollama texte /api/chat")
     return r.json().get("message", {}).get("content", "")
 
 
-def ollama_generate(prompt: str, s: dict[str, Any]) -> str:
+def ollama_generate(prompt: str, s: dict[str, Any],
+                    request_log: list[dict[str, Any]] | None = None) -> str:
     """Backward-compatible text helper used outside the A/B/C workflow."""
-    return ollama_chat_text(prompt, s)
+    return ollama_chat_text(prompt, s, request_log)
 
 
 def ollama_chat_vision(prompt: str, thumbs: list[Thumbnail], s: dict[str, Any], quality: int,
@@ -328,8 +344,9 @@ def ollama_chat_vision(prompt: str, thumbs: list[Thumbnail], s: dict[str, Any], 
     images=[thumbnail_to_ollama_base64(t, quality)[0] for t in thumbs]
     payload={"model": s["ollama_model"], "messages":[{"role":"user","content":prompt,"images":images}], "stream":False, "options":ollama_options(s)}
     url=f"{s['ollama_base_url'].rstrip('/')}/api/chat"
-    append_request_log(request_log, url, payload)
+    log_entry = append_request_log(request_log, url, payload)
     r=requests.post(url, json=payload, timeout=900)
+    complete_request_log(log_entry, r)
     if r.ok: return r.json().get("message",{}).get("content","")
     if len(thumbs) > 1:
         parts=[]
@@ -387,8 +404,9 @@ def build_comparison_prompt(s: dict[str, Any], analyses: dict[str, str]) -> str:
     )
 
 
-def ollama_generate_with_retry(prompt: str, s: dict[str, Any], retry_instruction: str) -> str:
-    response = ollama_generate(prompt, s)
+def ollama_generate_with_retry(prompt: str, s: dict[str, Any], retry_instruction: str,
+                               request_log: list[dict[str, Any]] | None = None) -> str:
+    response = ollama_generate(prompt, s, request_log)
     if not is_placeholder_llm_response(response):
         return response
     retry_prompt = (
@@ -396,8 +414,29 @@ def ollama_generate_with_retry(prompt: str, s: dict[str, Any], retry_instruction
         + "\n\nLa réponse précédente était vide ou incomplète (par exemple seulement ###). "
         + retry_instruction
     )
-    retry = ollama_generate(retry_prompt, s)
+    retry = ollama_generate(retry_prompt, s, request_log)
     return retry if retry.strip() else response
+
+
+def render_llm_logs(logs: list[dict[str, Any]], label: str) -> None:
+    """Show each LLM request and its complete raw response in separate controls."""
+    if not logs:
+        st.info("Aucun appel effectué pendant cette session.")
+        return
+    st.caption(
+        "Le prompt et tous les paramètres sont affichés; les images base64 sont remplacées "
+        "par leur taille et leur SHA-256. La réponse brute est affichée intégralement."
+    )
+    for index, entry in enumerate(logs, 1):
+        st.markdown(f"**Appel {index}**")
+        request_details = {key: value for key, value in entry.items() if key != "response_raw"}
+        st.json(request_details)
+        st.text_area(
+            f"Retour brut complet — {label} — appel {index}",
+            entry.get("response_raw", "[Aucune réponse HTTP reçue]"),
+            height=260,
+            key=f"raw_llm_log::{label}::{index}",
+        )
 
 def transcribe_video(path: Path, s: dict[str, Any], progress: ProgressCallback | None = None) -> str:
     def run(device, compute):
@@ -669,22 +708,24 @@ def main() -> None:
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         for key,label in [("analysis_a","A"),("analysis_b","B"),("analysis_c","C")]:
             st.text_area(label, st.session_state.get(key,""), height=180)
-            with st.expander(f"Log exact des requêtes envoyées — cas {label}"):
+            with st.expander(f"Log exact des appels LLM — cas {label}"):
                 logs = st.session_state.get(f"analysis_log_{label.lower()}", [])
-                st.caption("Le prompt et tous les paramètres sont affichés; les images base64 sont remplacées par leur taille et leur SHA-256.")
-                st.json(logs if logs else {"information": "Aucun appel effectué pendant cette session."})
+                render_llm_logs(logs, f"cas {label}")
     with tabs[5]:
         thumbs=st.session_state.get("thumbnails", []); transcript=st.session_state.get("transcript", "")
         st.subheader("D1 — Sélectionner les keyframes")
         if st.button("Sélectionner les keyframes"):
             task = ProgressReporter(progress_slot, "Sélection des keyframes")
             try:
+                st.session_state.analysis_log_d1 = []
                 task.update(0.15, "Envoi des vignettes au LLM")
                 prompt=common_prompt(s)+"""\nTu reçois une série de vignettes basse résolution extraites chronologiquement d’une vidéo. Ton rôle n’est pas encore de décrire toute la vidéo. Ton rôle est de choisir les images qui méritent une deuxième analyse en meilleure résolution. Sélectionne les images importantes pour comprendre la personne, le lieu, les objets, gestes, émotions, texte visible, changements de scène, moments où l’image ajoute du contexte au transcript. Retourne uniquement un JSON valide au format {\"selected_keyframes\":[{\"frame_index\":12,\"timestamp_sec\":34.5,\"priority\":\"high\",\"reason\":\"...\",\"suggested_focus\":\"...\"}]}\nTranscript réduit:\n"""+build_reduced_transcript_context(transcript, 3000)
-                raw=ollama_chat_vision(prompt, thumbs, s, s["thumbnail_jpeg_quality"]); st.session_state.keyframe_raw=raw; st.session_state.keyframe_json=extract_json_from_text(raw) or {}
+                raw=ollama_chat_vision(prompt, thumbs, s, s["thumbnail_jpeg_quality"], st.session_state.analysis_log_d1); st.session_state.keyframe_raw=raw; st.session_state.keyframe_json=extract_json_from_text(raw) or {}
                 task.complete("Keyframes sélectionnées")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         st.text_area("Réponse D1", st.session_state.get("keyframe_raw",""), height=160); st.json(st.session_state.get("keyframe_json",{}))
+        with st.expander("Log exact des appels LLM — sélection D1"):
+            render_llm_logs(st.session_state.get("analysis_log_d1", []), "sélection D1")
         st.subheader("D2 — Extraire les keyframes en meilleure qualité")
         if st.button("Extraire keyframes HQ") and st.session_state.get("video_path"):
             task = ProgressReporter(progress_slot, "Extraction des keyframes HQ")
@@ -699,25 +740,31 @@ def main() -> None:
         if st.button("Analyser keyframes HQ"):
             task = ProgressReporter(progress_slot, "Analyse D — Keyframes HQ")
             try:
+                st.session_state.analysis_log_d3 = []
                 task.update(0.15, "Envoi des keyframes au LLM")
                 prompt=common_prompt(s)+"\nAnalyse ces keyframes haute résolution. Pour chaque keyframe: timestamp, ce que l’image montre, ce que l’image ajoute au transcript, changement d’interprétation, détails visuels, texte visible, utilité faible/moyen/fort. Termine par une synthèse.\nRaisons de sélection:\n"+json.dumps(st.session_state.get("keyframe_json",{}), ensure_ascii=False)+"\nTranscript réduit:\n"+build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"]))
-                st.session_state.analysis_d=ollama_chat_vision(prompt, st.session_state.get("keyframes_hq",[]), s, s["two_pass_high_quality_jpeg_quality"])
+                st.session_state.analysis_d=ollama_chat_vision(prompt, st.session_state.get("keyframes_hq",[]), s, s["two_pass_high_quality_jpeg_quality"], st.session_state.analysis_log_d3)
                 task.complete("Analyse D terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         st.text_area("D — Two-pass keyframes", st.session_state.get("analysis_d",""), height=240)
+        with st.expander("Log exact des appels LLM — analyse D3"):
+            render_llm_logs(st.session_state.get("analysis_log_d3", []), "analyse D3")
     with tabs[6]:
         if st.button("Comparer A/B/C/D"):
             task = ProgressReporter(progress_slot, "Comparaison A/B/C/D")
             try:
+                st.session_state.comparison_log = []
                 task.update(0.15, "Génération de la synthèse finale")
                 analyses={"A": st.session_state.get("analysis_a", ""), "B": st.session_state.get("analysis_b", ""), "C": st.session_state.get("analysis_c", ""), "D": st.session_state.get("analysis_d", "")}
                 prompt=build_comparison_prompt(s, analyses)
-                st.session_state.comparison=ollama_generate_with_retry(prompt, s, "Réécris une comparaison complète en français, sans commencer par un titre Markdown isolé.")
+                st.session_state.comparison=ollama_generate_with_retry(prompt, s, "Réécris une comparaison complète en français, sans commencer par un titre Markdown isolé.", st.session_state.comparison_log)
                 if is_placeholder_llm_response(st.session_state.comparison):
                     st.warning("La réponse Ollama semble encore incomplète. Augmente num_predict et/ou réduis Transcript max chars, puis relance la comparaison.")
                 task.complete("Comparaison terminée")
             except OllamaError as e: task.fail(str(e)); st.error(str(e))
         st.text_area("Comparaison finale", st.session_state.get("comparison",""), height=400)
+        with st.expander("Log exact des appels LLM — comparaison"):
+            render_llm_logs(st.session_state.get("comparison_log", []), "comparaison")
     with tabs[7]:
         st.json({"options": ollama_options(s), "base_url": s["ollama_base_url"], "model": s["ollama_model"]})
         if st.button("Test /api/tags"):
