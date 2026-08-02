@@ -23,4 +23,12 @@ Les consignes des analyses A, B, C ainsi que celles des deux appels D1/D3 du mod
 
 Certains modèles raisonnants remplissent d'abord `message.thinking`. S'ils atteignent la limite `num_predict` avant de produire `message.content`, Ollama renvoie `done_reason: "length"` et la réponse finale est vide. L'application affiche alors une erreur explicite conseillant d'augmenter `num_predict` ou de réduire le transcript; le raisonnement incomplet reste disponible dans le log brut.
 
+## Réimplémenter l'option « two-pass keyframes »
+
+La méthodologie complète, indépendante de Streamlit et d'Ollama, est décrite dans
+[`docs/METHODOLOGIE_TWO_PASS_KEYFRAMES.md`](docs/METHODOLOGIE_TWO_PASS_KEYFRAMES.md).
+Le document détaille le contrat JSON entre les deux passes, l'extraction temporelle,
+les appels au modèle, un pseudo-code portable, les contrôles de robustesse et les
+critères permettant de valider une implémentation dans un autre logiciel.
+
 L'onglet **Test protocole LLM** permet d'envoyer librement un prompt (et, si nécessaire, une image) à `/api/chat` ou `/api/generate`. Chaque essai produit dans `ollama_protocol_tests/` une trace JSON contenant la requête, les métadonnées HTTP, le JSON décodé et la réponse brute. Les images en base64 ne sont pas recopiées dans la trace : leur taille et leur empreinte SHA-256 suffisent à identifier exactement l'entrée. Ces fichiers facilitent la comparaison du comportement des modèles et l'étude des champs ou marqueurs comme `<think>`.
