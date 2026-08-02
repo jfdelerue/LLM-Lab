@@ -566,6 +566,106 @@ def run_analysis_c(thumbs: list[Thumbnail], transcript: str, s: dict[str, Any],
     return "\n\n".join(results)
 
 
+def run_complete_pipeline(s: dict[str, Any], progress_slot: Any) -> None:
+    """Execute the seven application phases from the currently loaded video."""
+    video_path_value = st.session_state.get("video_path")
+    if not video_path_value:
+        st.error("Chargez d’abord une vidéo dans la phase 1.")
+        return
+
+    video_path = Path(video_path_value)
+    prompts = {**default_analysis_prompts(s), **default_two_pass_prompts(s)}
+    for key, value in prompts.items():
+        st.session_state.setdefault(key, value)
+
+    task = ProgressReporter(progress_slot, "Phase 1/7 — Chargement vidéo")
+    try:
+        task.complete("Vidéo chargée")
+
+        task = ProgressReporter(progress_slot, "Phase 2/7 — Paramètres")
+        task.complete("Paramètres actifs appliqués")
+
+        task = ProgressReporter(progress_slot, "Phase 3/7 — Extraction des vignettes")
+        thumbs_dir = video_path.parent / "thumbs"
+        shutil.rmtree(thumbs_dir, ignore_errors=True)
+        thumbs = extract_thumbnails(
+            video_path, thumbs_dir, s["thumbnail_interval_sec"], s["thumbnail_max_frames"],
+            s["thumbnail_largest_side_px"], s["thumbnail_jpeg_quality"], task.update,
+        )
+        st.session_state.thumbnails = thumbs
+        task.complete(f"{len(thumbs)} vignette(s) extraite(s)")
+
+        task = ProgressReporter(progress_slot, "Phase 4/7 — Transcription")
+        transcript = transcribe_video(video_path, s, task.update)
+        st.session_state.transcript = transcript
+        task.complete("Transcript terminé")
+
+        require_vision_model(s)
+        task = ProgressReporter(progress_slot, "Phase 5/7 — Analyses A/B/C")
+        for log_key in ("analysis_log_a", "analysis_log_b", "analysis_log_c"):
+            st.session_state[log_key] = []
+        st.session_state.analysis_a = run_analysis_a(
+            thumbs, s, st.session_state.analysis_prompt_a, task, st.session_state.analysis_log_a
+        )
+        st.session_state.analysis_b = run_analysis_b(
+            transcript, s, st.session_state.analysis_prompt_b,
+            st.session_state.analysis_prompt_b_summary, task, st.session_state.analysis_log_b,
+        )
+        st.session_state.analysis_c = run_analysis_c(
+            thumbs, transcript, s, st.session_state.analysis_prompt_c, task,
+            st.session_state.analysis_log_c,
+        )
+        task.complete("Analyses A, B et C terminées")
+
+        task = ProgressReporter(progress_slot, "Phase 6/7 — Two-pass keyframes")
+        st.session_state.analysis_log_d1 = []
+        selection_prompt = (
+            st.session_state.analysis_prompt_d1 + "\nTranscript réduit:\n"
+            + build_reduced_transcript_context(transcript, 3000)
+        )
+        raw = ollama_chat_vision(
+            selection_prompt, thumbs, s, s["thumbnail_jpeg_quality"],
+            st.session_state.analysis_log_d1,
+        )
+        st.session_state.keyframe_raw = raw
+        st.session_state.keyframe_json = extract_json_from_text(raw) or {}
+        selected = st.session_state.keyframe_json.get("selected_keyframes", [])
+        st.session_state.keyframes_hq = extract_keyframes(
+            video_path, selected, video_path.parent / "keyframes", s["two_pass_max_keyframes"],
+            s["two_pass_high_quality_largest_side_px"], s["two_pass_high_quality_jpeg_quality"],
+            s["two_pass_context_before_sec"], s["two_pass_context_after_sec"], task.update,
+        )
+        st.session_state.analysis_log_d3 = []
+        analysis_prompt = (
+            st.session_state.analysis_prompt_d3 + "\nRaisons de sélection:\n"
+            + json.dumps(st.session_state.keyframe_json, ensure_ascii=False)
+            + "\nTranscript réduit:\n"
+            + build_reduced_transcript_context(transcript, int(s["transcript_context_max_chars"]))
+        )
+        st.session_state.analysis_d = ollama_chat_vision(
+            analysis_prompt, st.session_state.keyframes_hq, s,
+            s["two_pass_high_quality_jpeg_quality"], st.session_state.analysis_log_d3,
+        )
+        task.complete("Sélection, extraction HQ et analyse D terminées")
+
+        task = ProgressReporter(progress_slot, "Phase 7/7 — Comparaison")
+        st.session_state.comparison_log = []
+        analyses = {
+            "A": st.session_state.analysis_a, "B": st.session_state.analysis_b,
+            "C": st.session_state.analysis_c, "D": st.session_state.analysis_d,
+        }
+        st.session_state.comparison = ollama_generate_with_retry(
+            build_comparison_prompt(s, analyses), s,
+            "Réécris une comparaison complète en français, sans commencer par un titre Markdown isolé.",
+            st.session_state.comparison_log,
+        )
+        task.complete("Toutes les phases sont terminées")
+        st.success("Les phases 1 à 7 ont été exécutées avec succès.")
+    except (OllamaError, TranscriptionError, RuntimeError, ValueError) as exc:
+        task.fail(str(exc))
+        st.error(str(exc))
+
+
 def sidebar() -> dict[str, Any]:
     if "settings" not in st.session_state: st.session_state.settings = load_settings()
     s=st.session_state.settings
@@ -618,6 +718,13 @@ def main() -> None:
     # Declared before the tabs so every long-running task reports at the top of the page.
     progress_slot = st.empty()
     st.info("Même si les images envoyées sont très petites, Qwen2.5-VL peut les normaliser en interne vers une taille minimale de traitement. Si l’analyse échoue, réduire les images par appel, la taille du transcript ou le nombre de keyframes, et ajuster num_ctx selon l'erreur.")
+    if st.button(
+        "▶ Exécuter toutes les phases 1 à 7",
+        type="primary",
+        use_container_width=True,
+        help="Utilise la vidéo chargée et enchaîne extraction, transcription, analyses, keyframes et comparaison.",
+    ):
+        run_complete_pipeline(s, progress_slot)
     tabs=st.tabs(["1. Chargement vidéo","2. Paramètres","3. Extraction des vignettes","4. Transcript","5. Analyse LLM A/B/C","6. Two-pass keyframes","7. Comparaison","8. Diagnostic Ollama","9. Test protocole LLM"])
     with tabs[0]:
         f=st.file_uploader("Charger une vidéo", type=["mp4","mov","mkv","avi","webm"])
